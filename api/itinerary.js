@@ -1,11 +1,16 @@
 /**
  * POST /api/itinerary
  *
- * The only place the Gemini key exists. The browser never sees it.
+ * The only place the model API key exists. The browser never sees it.
+ *
+ * Provider is Groq. Google's AQ.-prefixed keys authenticate for ListModels but
+ * return 404 on generateContent, so Gemini was unusable; the Gemini
+ * implementation is in git history if that is ever fixed. Only this file's HTTP
+ * call and the schema dialect were provider-specific.
  *
  * Responsibilities, in order:
  *   1. Validate the incoming prompt.
- *   2. Call Gemini with a responseSchema so JSON is enforced provider-side.
+ *   2. Call the provider with a JSON Schema so shape is enforced upstream.
  *   3. Run the parse ladder (fenced markdown -> brace slice -> JSON.parse).
  *   4. Validate with zod. If it fails, ONE repair round-trip that hands the
  *      model its own output plus the exact validation errors.
@@ -13,11 +18,12 @@
  *      copy instead of a generic "something went wrong".
  */
 
-import { geminiResponseSchema, parseItinerary } from '../shared/schema.js';
+import { jsonSchema, parseItinerary } from '../shared/schema.js';
 
-const MODEL = 'gemini-2.0-flash';
-const ENDPOINT = (model) =>
-  `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+// Overridable without a code change: providers retire model ids on a schedule,
+// so `GROQ_MODEL=...` in .env or Vercel beats editing source.
+const MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
 
 const UPSTREAM_TIMEOUT_MS = 22_000;
 const MAX_PROMPT_CHARS = 2000;
@@ -67,45 +73,66 @@ export function extractJson(text) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Gemini                                                                     */
+/* Provider call                                                              */
 /* -------------------------------------------------------------------------- */
 
-async function callGemini({ apiKey, userParts, signal }) {
-  const res = await fetch(`${ENDPOINT(MODEL)}?key=${encodeURIComponent(apiKey)}`, {
+/**
+ * One chat completion. `strict` asks for json_schema-constrained output; not
+ * every model supports it, so a 400 naming response_format retries once in
+ * plain JSON mode with the schema moved into the prompt. Degrading on a
+ * provider capability beats failing the user's request over it.
+ */
+async function callModel({ apiKey, messages, signal, strict = true }) {
+  const system = [{ role: 'system', content: SYSTEM_INSTRUCTION }];
+  if (!strict) {
+    system.push({
+      role: 'system',
+      content: `Return JSON matching this JSON Schema exactly:\n${JSON.stringify(jsonSchema)}`,
+    });
+  }
+
+  const res = await fetch(ENDPOINT, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
     signal,
     body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
-      contents: [{ role: 'user', parts: userParts }],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        responseSchema: geminiResponseSchema,
-        temperature: 0.7,
-        maxOutputTokens: 4096,
-      },
+      model: MODEL,
+      messages: [...system, ...messages],
+      temperature: 0.7,
+      max_tokens: 4096,
+      response_format: strict
+        ? { type: 'json_schema', json_schema: { name: 'itinerary', strict: true, schema: jsonSchema } }
+        : { type: 'json_object' },
     }),
   });
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    const err = new Error(`gemini ${res.status}: ${body.slice(0, 400)}`);
+    if (res.status === 400 && strict && /response_format|json_schema|schema/i.test(body)) {
+      console.warn('[itinerary] json_schema unsupported, retrying in json_object mode');
+      return callModel({ apiKey, messages, signal, strict: false });
+    }
+    const err = new Error(`provider ${res.status}: ${body.slice(0, 400)}`);
     err.status = res.status;
     throw err;
   }
 
   const json = await res.json();
+  const choice = json?.choices?.[0];
 
-  if (json?.promptFeedback?.blockReason) {
-    const err = new Error(`blocked: ${json.promptFeedback.blockReason}`);
+  if (choice?.finish_reason === 'content_filter') {
+    const err = new Error('blocked by provider content filter');
     err.code = 'BLOCKED';
     throw err;
   }
 
-  const candidate = json?.candidates?.[0];
-  const text = candidate?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
-
-  return { text, finishReason: candidate?.finishReason ?? null };
+  return {
+    text: choice?.message?.content ?? '',
+    finishReason: choice?.finish_reason ?? null,
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -139,8 +166,42 @@ const CHAOS = {
 /* Handler                                                                    */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Errors the user can meaningfully retry. The client uses this to decide
+ * whether to render a Retry button or a "fix your setup" message — retrying a
+ * rejected API key forever is just a worse error message.
+ */
+const RETRYABLE = new Set([
+  'RATE_LIMIT',
+  'TIMEOUT',
+  'NETWORK',
+  'UPSTREAM',
+  'EMPTY',
+  'UNPARSEABLE',
+  'BAD_SHAPE',
+  'UNKNOWN',
+]);
+// UPSTREAM_AUTH, UPSTREAM_MODEL and UPSTREAM_REQUEST are deliberately absent:
+// retrying a rejected key or a wrong model id just produces the same failure.
+
 const fail = (res, status, code, message, extra = {}) =>
-  res.status(status).json({ error: { code, message, ...extra } });
+  res.status(status).json({
+    error: { code, message, retryable: RETRYABLE.has(code), ...extra },
+  });
+
+/** Never echo anything key-shaped back to the client, even from an error body. */
+const redact = (v) => String(v ?? '').replace(/AIza[0-9A-Za-z_-]{10,}/g, '<redacted>');
+
+/** Transport-level failures: DNS, reset connection, refused, offline. */
+function isNetworkError(err) {
+  const cause = err?.cause?.code ?? err?.code;
+  return (
+    (err instanceof TypeError && /fetch failed/i.test(err.message ?? '')) ||
+    ['ENOTFOUND', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET'].includes(
+      cause
+    )
+  );
+}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -148,9 +209,9 @@ export default async function handler(req, res) {
     return fail(res, 405, 'METHOD_NOT_ALLOWED', 'Use POST.');
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
-    return fail(res, 500, 'CONFIG', 'GEMINI_API_KEY is not set on the server.');
+    return fail(res, 500, 'CONFIG', 'GROQ_API_KEY is not set on the server.');
   }
 
   const body = typeof req.body === 'string' ? safeJson(req.body) : req.body;
@@ -175,9 +236,9 @@ export default async function handler(req, res) {
     if (chaos && CHAOS[chaos]) {
       first = CHAOS[chaos]();
     } else {
-      first = await callGemini({
+      first = await callModel({
         apiKey,
-        userParts: [{ text: prompt }],
+        messages: [{ role: 'user', content: prompt }],
         signal: controller.signal,
       });
     }
@@ -190,12 +251,13 @@ export default async function handler(req, res) {
     let repaired = false;
     if (!attempt.ok && !chaos) {
       repaired = true;
-      const second = await callGemini({
+      const second = await callModel({
         apiKey,
-        userParts: [
-          { text: prompt },
+        messages: [
+          { role: 'user', content: prompt },
           {
-            text: [
+            role: 'user',
+            content: [
               'Your previous response was rejected by schema validation.',
               '',
               'Previous response:',
@@ -236,10 +298,37 @@ export default async function handler(req, res) {
     if (err.code === 'BLOCKED') {
       return fail(res, 422, 'BLOCKED', 'That prompt was blocked by the safety filter.');
     }
+    if (isNetworkError(err)) {
+      console.error('[itinerary] network', err?.cause?.code ?? err.message);
+      return fail(res, 503, 'NETWORK', 'Could not reach the model service. Check your connection and retry.');
+    }
     if (err.status === 429) {
       return fail(res, 429, 'RATE_LIMIT', 'Rate limit hit. Wait a moment and retry.');
     }
-    if (err.status >= 500 || err.status === 503) {
+    if (err.status === 400 || err.status === 401 || err.status === 403) {
+      const detail = redact(err.message);
+      console.error('[itinerary] upstream rejected request', detail);
+
+      // A 400 means either "your key is bad" or "your request is bad", and
+      // those need opposite fixes. Guessing wrong sends people hunting for a
+      // key problem that isn't there, so disambiguate on the upstream message
+      // and surface it.
+      const looksLikeAuth =
+        err.status !== 400 || /api[\s_-]?key|API_KEY_INVALID|permission|unauthenticated/i.test(detail);
+
+      return looksLikeAuth
+        ? fail(res, 500, 'UPSTREAM_AUTH', 'The model service rejected the key. Check GROQ_API_KEY on the server.', { detail })
+        : fail(res, 500, 'UPSTREAM_REQUEST', `The model service rejected the request itself — likely the responseSchema or a bad "${MODEL}" parameter.`, { detail });
+    }
+    if (err.status === 404) {
+      return fail(
+        res,
+        500,
+        'UPSTREAM_MODEL',
+        `Model "${MODEL}" was not found for this API key. List what your key can use, then set GROQ_MODEL in .env.`
+      );
+    }
+    if (err.status >= 500) {
       return fail(res, 502, 'UPSTREAM', 'The model service is unavailable. Try again.');
     }
     console.error('[itinerary] unexpected', err);
@@ -251,7 +340,7 @@ export default async function handler(req, res) {
 
 /** Run the ladder + zod on one model response and classify the outcome. */
 function evaluate({ text, finishReason }) {
-  if (finishReason === 'MAX_TOKENS') {
+  if (finishReason === 'length') {
     return {
       ok: false,
       code: 'UNPARSEABLE',

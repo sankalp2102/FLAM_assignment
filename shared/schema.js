@@ -21,61 +21,56 @@ export const CATEGORIES = ['food', 'sight', 'activity', 'transit', 'rest', 'lodg
 export const TIMES_OF_DAY = ['morning', 'afternoon', 'evening'];
 
 /* -------------------------------------------------------------------------- */
-/* Gemini responseSchema (OpenAPI subset — no additionalProperties, no $ref)   */
+/* JSON Schema sent to the provider (OpenAI dialect, strict-compatible).      */
+/*                                                                            */
+/* Strict mode requires additionalProperties: false on every object and every  */
+/* property listed in `required` — including `optional`, which the model must  */
+/* therefore always emit. Zod still coerces it, so an absent value is safe.    */
 /* -------------------------------------------------------------------------- */
 
-export const geminiResponseSchema = {
+const str = { type: 'string' };
+const int = { type: 'integer' };
+
+export const jsonSchema = {
   type: 'object',
+  additionalProperties: false,
+  required: ['trip', 'days'],
   properties: {
     trip: {
       type: 'object',
-      properties: {
-        title: { type: 'string' },
-        destination: { type: 'string' },
-        durationDays: { type: 'integer' },
-        summary: { type: 'string' },
-      },
+      additionalProperties: false,
       required: ['title', 'destination', 'durationDays', 'summary'],
-      propertyOrdering: ['title', 'destination', 'durationDays', 'summary'],
+      properties: { title: str, destination: str, durationDays: int, summary: str },
     },
     days: {
       type: 'array',
       items: {
         type: 'object',
+        additionalProperties: false,
+        required: ['dayNumber', 'title', 'stops'],
         properties: {
-          dayNumber: { type: 'integer' },
-          title: { type: 'string' },
+          dayNumber: int,
+          title: str,
           stops: {
             type: 'array',
             items: {
               type: 'object',
+              additionalProperties: false,
+              required: ['name', 'category', 'timeOfDay', 'durationMins', 'description', 'optional'],
               properties: {
-                name: { type: 'string' },
+                name: str,
                 category: { type: 'string', enum: CATEGORIES },
                 timeOfDay: { type: 'string', enum: TIMES_OF_DAY },
-                durationMins: { type: 'integer' },
-                description: { type: 'string' },
+                durationMins: int,
+                description: str,
                 optional: { type: 'boolean' },
               },
-              required: ['name', 'category', 'timeOfDay', 'durationMins', 'description'],
-              propertyOrdering: [
-                'name',
-                'category',
-                'timeOfDay',
-                'durationMins',
-                'description',
-                'optional',
-              ],
             },
           },
         },
-        required: ['dayNumber', 'title', 'stops'],
-        propertyOrdering: ['dayNumber', 'title', 'stops'],
       },
     },
   },
-  required: ['trip', 'days'],
-  propertyOrdering: ['trip', 'days'],
 };
 
 /* -------------------------------------------------------------------------- */
